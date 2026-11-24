@@ -1,0 +1,95 @@
+# Build, vet and unit-test sysbox-runc on every pull request.
+#
+# sysbox-runc can't build on its own: its go.mod replaces the other Sysbox
+# modules with sibling directories (e.g., ../sysbox-ipc). So this workflow
+# checks out the pull request next to the current heads of those repos,
+# which is the same layout the sysbox superproject uses.
+
+name: ci
+
+on:
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  BUILDTAGS: seccomp apparmor idmapped_mnt
+
+jobs:
+  unit:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      # The pull request under test.
+      - uses: actions/checkout@v4
+        with:
+          path: sysbox-runc
+
+      # Sibling repos that sysbox-runc's go.mod points at. They are taken at
+      # their default branch, i.e., what the next superproject bump would use.
+      - uses: actions/checkout@v4
+        with:
+          repository: nestybox/sysbox-ipc
+          path: sysbox-ipc
+      - uses: actions/checkout@v4
+        with:
+          repository: nestybox/sysbox-libs
+          path: sysbox-libs
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: sysbox-runc/go.mod
+          cache-dependency-path: sysbox-runc/go.sum
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libseccomp-dev libapparmor-dev pkg-config unzip
+
+      # The sysbox-ipc gRPC code is generated at build time. Use the same
+      # protoc version as the Sysbox test and packaging images.
+      - name: Install protoc and its Go plugins
+        run: |
+          curl -sSL -o /tmp/protoc.zip \
+            https://github.com/protocolbuffers/protobuf/releases/download/v3.15.8/protoc-3.15.8-linux-x86_64.zip
+          sudo unzip -q -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+          sudo chmod 755 /usr/local/bin/protoc
+          sudo chmod -R a+rX /usr/local/include/google
+          go install github.com/golang/protobuf/protoc-gen-go@v1.5.4
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Generate the sysbox-ipc protobuf code
+        run: |
+          make -C sysbox-ipc/sysboxFsGrpc/sysboxFsProtobuf
+          make -C sysbox-ipc/sysboxMgrGrpc/sysboxMgrProtobuf
+
+      - name: Build
+        working-directory: sysbox-runc
+        env:
+          CGO_ENABLED: "1"
+        run: go build -buildvcs=false -tags "$BUILDTAGS" ./...
+
+      # The unkeyed-fields check is off because the existing code builds
+      # some struct literals that way.
+      - name: Vet
+        working-directory: sysbox-runc
+        run: go vet -buildvcs=false -composites=false -tags "$BUILDTAGS" ./...
+
+      # Many of the tests create mounts, namespaces and cgroups, so they must
+      # run as root.
+      - name: Unit tests
+        working-directory: sysbox-runc
+        run: |
+          sudo -E env "PATH=$PATH" "HOME=$HOME" \
+            go test -buildvcs=false -timeout 10m -tags "$BUILDTAGS" ./...
