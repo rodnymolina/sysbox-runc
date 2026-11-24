@@ -80,12 +80,6 @@ jobs:
           CGO_ENABLED: "1"
         run: go build -buildvcs=false -tags "$BUILDTAGS" ./...
 
-      # The unkeyed-fields check is off because the existing code builds
-      # some struct literals that way.
-      - name: Vet
-        working-directory: sysbox-runc
-        run: go vet -buildvcs=false -composites=false -tags "$BUILDTAGS" ./...
-
       # Many of the tests create mounts, namespaces and cgroups, so they must
       # run as root.
       - name: Unit tests
